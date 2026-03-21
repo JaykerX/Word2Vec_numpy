@@ -73,31 +73,34 @@ class Word2VecSGNS:
         return z
 
     def train_step(self, center, context, negatives, lr):
-        v_c = self.W[center]
-        v_o = self.W_out[context]
-        v_neg = self.W_out[negatives]
+        v_c = self.W[center].copy()
+        v_o = self.W_out[context].copy()
+        v_neg = self.W_out[negatives].copy()
 
-        score_pos = np.clip(np.dot(v_c, v_o), -100, 100)
-        score_neg = np.clip(np.dot(v_neg, v_c), -100, 100)
+        score_pos = np.dot(v_c, v_o)
+        score_neg = v_neg @ v_c
 
-        loss = -np.log(self.sigmoid(score_pos) + 1e-10)
-        loss -= np.sum(np.log(self.sigmoid(-score_neg) + 1e-10))
+        sig_pos = self.sigmoid(score_pos)
+        sig_neg = self.sigmoid(score_neg)
 
-        grad_pos = self.sigmoid(score_pos) - 1
-        grad_neg = self.sigmoid(score_neg)
+        grad_vc = (sig_pos - 1) * v_o + (sig_neg @ v_neg) / len(negatives)
+        grad_vo = (sig_pos - 1) * v_c
+        grad_vnegs = np.outer(sig_neg, v_c)
 
-        grad_vc = grad_pos * v_o + np.dot(grad_neg, v_neg)
+        grad_vc   = np.clip(grad_vc,   -5, 5)
+        grad_vo   = np.clip(grad_vo,   -5, 5)
+        grad_vnegs = np.clip(grad_vnegs, -5, 5)
 
-        self.W[center] -= lr * grad_vc
-        self.W_out[context] -= lr * (grad_pos * v_c)
+        self.W[center]      -= lr * grad_vc
+        self.W_out[context] -= lr * grad_vo
 
-        for i, neg in enumerate(negatives):
-            self.W_out[neg] -= lr * (grad_neg[i] * v_c)
+        np.add.at(self.W_out, negatives, -lr * grad_vnegs)
 
+        loss = -np.log(sig_pos + 1e-10) - np.sum(np.log(self.sigmoid(-score_neg) + 1e-10))
         return loss
 
 
-def train(vocab_size, dim, window_size, neg_samples, lr, epochs, train_tokens, url="http://mattmahoney.net/dc/text8.zip", path="text8.zip", inner_file="text8"):
+def train(vocab_size, dim, window_size, neg_samples, lr, lr_min, epochs, train_tokens, url="http://mattmahoney.net/dc/text8.zip", path="text8.zip", inner_file="text8"):
     text = download_dataset(url, path, inner_file)
     tokens = tokenize(text)
 
@@ -106,6 +109,7 @@ def train(vocab_size, dim, window_size, neg_samples, lr, epochs, train_tokens, u
     vocab, id2word, word_counts = build_vocab(tokens, vocab_size=vocab_size)
 
     tokens = [w for w in tokens if w in vocab]
+    tokens = subsample(tokens, word_counts, vocab)
 
     neg_dist = get_negative_distribution(word_counts)
 
@@ -115,15 +119,19 @@ def train(vocab_size, dim, window_size, neg_samples, lr, epochs, train_tokens, u
     neg_samples = neg_samples
     lr = lr
     epochs = epochs
-
+    total_steps = len(tokens) * epochs
+    global_step = 0
     for epoch in range(epochs):
         total_loss = 0
         count = 0
 
         for center, context in generate_pairs_stream(tokens, vocab, window_size):
             negatives = np.random.choice(len(vocab), size=neg_samples, p=neg_dist)
+            lr_current = lr * max(1 - global_step / total_steps, lr_min)
+            loss = model.train_step(center, context, negatives, lr_current)
 
-            loss = model.train_step(center, context, negatives, lr)
+            global_step += 1
+            loss = model.train_step(center, context, negatives, lr_current)
 
             total_loss += loss
             count += 1
@@ -138,14 +146,16 @@ def train(vocab_size, dim, window_size, neg_samples, lr, epochs, train_tokens, u
 
 if __name__ == "__main__":
 
-    model, vocab, id2word = train(vocab_size=30000, dim=100, window_size=2, neg_samples=5, lr=0.025, epochs=1, train_tokens=100000)
+    model, vocab, id2word = train(vocab_size=30000, dim=100, window_size=2, neg_samples=5, lr=0.025, lr_min=0.0001, epochs=2, train_tokens=200000)
+
+    path = "word2vec_model_big.npz"
 
     np.savez(
-        "word2vec_model.npz",
+        path,
         W=model.W,
         W_out=model.W_out,
         vocab=vocab,
         id2word=id2word
     )
 
-    print("Model saved to word2vec_model.npz")
+    print(f"Model saved to {path}")
