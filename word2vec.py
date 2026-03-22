@@ -31,7 +31,7 @@ def build_vocab(tokens, vocab_size=30000):
 def subsample(tokens, word_counts, vocab, t=1e-5):
     total = sum(word_counts)
     freqs = word_counts / total
-    prob_drop = 1 - np.sqrt(t / freqs)
+    prob_drop = np.maximum(0, 1 - np.sqrt(t / freqs))
 
     result = []
     for w in tokens:
@@ -58,6 +58,21 @@ def get_negative_distribution(word_counts):
     p = word_counts ** 0.75
     return p / np.sum(p)
 
+def build_unigram_table(word_counts, table_size=20000000):
+    p = word_counts ** 0.75
+    p /= np.sum(p)
+
+    table = np.zeros(table_size, dtype=np.int32)
+    i = 0
+    cumulative = p[0]
+
+    for j in range(table_size):
+        table[j] = i
+        if j / table_size > cumulative:
+            i += 1
+            cumulative += p[i]
+
+    return table
 
 class Word2VecSGNS:
     def __init__(self, vocab_size, dim):
@@ -83,7 +98,7 @@ class Word2VecSGNS:
         sig_pos = self.sigmoid(score_pos)
         sig_neg = self.sigmoid(score_neg)
 
-        grad_vc = (sig_pos - 1) * v_o + (sig_neg @ v_neg) / len(negatives)
+        grad_vc = (sig_pos - 1) * v_o + sig_neg @ v_neg
         grad_vo = (sig_pos - 1) * v_c
         grad_vnegs = np.outer(sig_neg, v_c)
 
@@ -100,7 +115,7 @@ class Word2VecSGNS:
         return loss
 
 
-def train(vocab_size, dim, window_size, neg_samples, lr, lr_min, epochs, train_tokens, url="http://mattmahoney.net/dc/text8.zip", path="text8.zip", inner_file="text8"):
+def train(vocab_size, dim, window_size, neg_samples, lr, lr_min, epochs, train_tokens, es, url="http://mattmahoney.net/dc/text8.zip", path="text8.zip", inner_file="text8"):
     text = download_dataset(url, path, inner_file)
     tokens = tokenize(text)
 
@@ -110,28 +125,31 @@ def train(vocab_size, dim, window_size, neg_samples, lr, lr_min, epochs, train_t
 
     tokens = [w for w in tokens if w in vocab]
     tokens = subsample(tokens, word_counts, vocab)
+    new_counts = Counter(tokens)
+    word_counts = np.array([new_counts[id2word[i]] for i in range(len(id2word))])
 
     neg_dist = get_negative_distribution(word_counts)
-
+    unigram_table = build_unigram_table(word_counts)
     model = Word2VecSGNS(len(vocab), dim=dim)
 
     window_size = window_size
     neg_samples = neg_samples
     lr = lr
     epochs = epochs
+    prev_loss = float('inf')
     total_steps = len(tokens) * epochs
     global_step = 0
     for epoch in range(epochs):
+        random.shuffle(tokens)
         total_loss = 0
         count = 0
 
         for center, context in generate_pairs_stream(tokens, vocab, window_size):
-            negatives = np.random.choice(len(vocab), size=neg_samples, p=neg_dist)
-            lr_current = lr * max(1 - global_step / total_steps, lr_min)
+            negatives = unigram_table[np.random.randint(0, len(unigram_table), size=neg_samples)]
+            lr_current = max(lr * (1 - global_step / total_steps), lr_min)
             loss = model.train_step(center, context, negatives, lr_current)
 
             global_step += 1
-            loss = model.train_step(center, context, negatives, lr_current)
 
             total_loss += loss
             count += 1
@@ -141,12 +159,18 @@ def train(vocab_size, dim, window_size, neg_samples, lr, lr_min, epochs, train_t
 
         print(f"Epoch {epoch+1} done, Avg Loss: {total_loss / count:.4f}")
 
+        if es:
+            if total_loss / count >= prev_loss:
+                print("Early stopping triggered.")
+                break
+            prev_loss = total_loss / count
+
     return model, vocab, id2word
 
 
 if __name__ == "__main__":
 
-    model, vocab, id2word = train(vocab_size=30000, dim=100, window_size=2, neg_samples=5, lr=0.025, lr_min=0.0001, epochs=2, train_tokens=200000)
+    model, vocab, id2word = train(vocab_size=30000, dim=100, window_size=5, neg_samples=5, lr=0.01, lr_min=0.0001, epochs=5, train_tokens=10000000, es=True)
 
     path = "word2vec_model_big.npz"
 
